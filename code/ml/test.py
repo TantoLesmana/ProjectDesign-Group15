@@ -1,58 +1,63 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import joblib
 
 
-# 1. Load the TFLite model and allocate tensors.
-interpreter = tf.lite.Interpreter(model_path="code/ml/food_model_ktinos.tflite")
+MODEL = "./models/tflite_models/food_classifier.tflite"
+SCALER = "./models/scaler/food_classifier_scaler.pkl"
+# DATASET = "./code/ml/mq_sensors_log_ktinos_mera1.csv"
+DATASET = "./dataset/data2.xlsx"
+TRAINING_COLUMNS = ["MQ2A", "MQ3A", "MQ4A", "MQ8A", "MQ9A", "MQ135A"]
+
+
+# Load the TFLite model and allocate tensors.
+interpreter = tf.lite.Interpreter(model_path=MODEL)
 interpreter.allocate_tensors()
 
-# 2. Get input and output tensor details.
+# Get input and output tensor details.
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
 # input data
-df = pd.read_csv("code/ml/mq_sensors_log_ktinos_mera1.csv")
+# df = pd.read_csv(DATASET)
+df = pd.read_excel(DATASET)
 feature_columns = ['Raw_value_MQ2', 'Raw_value_MQ3', 'Raw_value_MQ4', 'Raw_value_MQ135',
                    'Raw_value_MQ6', 'Raw_value_MQ7', 'Raw_value_MQ8', 'Raw_value_MQ9']
-raw_features = df[feature_columns].values
+NEW_INPUT_MAP = {
+    'Raw_value_MQ2': 'MQ2A',
+    'Raw_value_MQ3': 'MQ3A',
+    'Raw_value_MQ4': 'MQ4A',
+    'Raw_value_MQ8': 'MQ8A',
+    'Raw_value_MQ9': 'MQ9A',
+    'Raw_value_MQ135': 'MQ135A'
+}
+# df.rename(columns=NEW_INPUT_MAP, inplace=True)
+raw_features = df[TRAINING_COLUMNS].values
 
-max_value = 65535.0  # Common max for 16-bit raw sensor data
-scaled_features = raw_features / max_value
+# Load trained scaler
+scaler = joblib.load(SCALER)
+scaled_features = scaler.transform(raw_features)
 input_index = input_details[0]['index']
 all_scaled_features = scaled_features.astype(input_details[0]['dtype'])
-
-# # Assuming your model has one input tensor at index 0
-# input_shape = input_details[0]['shape']
-
-# # 3. Prepare your input data (replace this with your actual test data)
-# # This example creates random data matching the model's expected shape and dtype.
-# input_data = np.array(np.random.random_sample(input_shape), dtype=np.float32)
-
-# 4. Set the tensor, invoke the interpreter, and get the output.
-# print(len(input_data))
 
 all_predictions = []
 
 # Loop through each row of your data (1448 times)
 for single_sample in all_scaled_features:
-    # 1. Reshape the 1D sample (8,) into the required 2D input shape (1, 8)
-    # and ensure it's the correct float32 type.
-    input_data = single_sample.reshape(1, 8).astype(np.float32)
+    # Reshape Input
+    input_data = single_sample.reshape(1, len(TRAINING_COLUMNS)).astype(np.float32)
 
-    # 2. Set the tensor for the single sample
-    # The 'ValueError' will now be fixed because input_data.shape[0] is 1
+    # Set Tensor
     interpreter.set_tensor(input_index, input_data)
 
-    # 3. Run the model
+    # Run the model
     interpreter.invoke()
 
-    # 4. Get the prediction
+    # Get the prediction
     prediction = interpreter.get_tensor(output_details[0]['index'])
     all_predictions.append(prediction)
 
-# Combine all the predictions into a single array (e.g., shape 1448, 2)
+# Combine all the predictions into a single array
 final_predictions = np.vstack(all_predictions)
-
-# 5. Interpret the output
 print("Model Output:\n", final_predictions)
