@@ -5,6 +5,7 @@ Menerima data sensor dari ESP32, jalankan inference, kirim hasil prediksi kembal
 """
 
 import serial
+import serial.tools.list_ports
 import numpy as np
 import time
 import sys
@@ -15,10 +16,10 @@ import re
 
 # TensorFlow Lite import
 try:
-    import tflite_runtime.interpreter as tflite
+    import tensorflow as tf
     TFLITE_AVAILABLE = True
 except ImportError:
-    print("⚠️ TensorFlow Lite not available. Install with: pip install tflite-runtime")
+    print("⚠️ TensorFlow not available. Install with: pip install tensorflow")
     TFLITE_AVAILABLE = False
 
 class ESP32BidirectionalProcessor:
@@ -68,7 +69,7 @@ class ESP32BidirectionalProcessor:
     def setup_model(self):
         """Setup TensorFlow Lite model"""
         try:
-            self.interpreter = tflite.Interpreter(model_path=self.model_path)
+            self.interpreter = tf.lite.Interpreter(model_path=self.model_path)
             self.interpreter.allocate_tensors()
             
             self.input_details = self.interpreter.get_input_details()
@@ -95,32 +96,95 @@ class ESP32BidirectionalProcessor:
         except Exception as e:
             print(f"❌ Error creating CSV file: {e}")
     
+    def list_available_ports(self):
+        """List semua port serial yang tersedia"""
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            print("❌ No serial ports found")
+            return []
+        
+        print("\n📋 Available Serial Ports:")
+        print("-" * 60)
+        available_ports = []
+        for port, desc, hwid in sorted(ports):
+            print(f"  {port:10} - {desc}")
+            print(f"             HWID: {hwid}")
+            available_ports.append(port)
+        print("-" * 60)
+        return available_ports
+    
     def connect_serial(self):
         """Koneksi ke ESP32 via Serial"""
+        # List available ports first
+        available_ports = self.list_available_ports()
+        
+        if self.port not in available_ports:
+            print(f"\n⚠️ Port {self.port} tidak ditemukan dalam daftar port yang tersedia")
+            if available_ports:
+                print(f"💡 Port yang tersedia: {', '.join(available_ports)}")
+                print(f"💡 Coba gunakan salah satu port di atas atau ubah konfigurasi PORT")
+            return False
+        
         try:
-            print(f"🔌 Attempting to connect to {self.port} at {self.baudrate} baud...")
+            print(f"\n🔌 Attempting to connect to {self.port} at {self.baudrate} baud...")
             self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=1)
             time.sleep(2)  # Wait for connection
             print(f"✅ Connected to ESP32 on {self.port}")
             return True
-        except serial.SerialException as e:
-            print(f"❌ Serial connection error: {e}")
-            print("💡 Check if:")
-            print("   - ESP32 is connected via USB")
-            print("   - Correct COM port is selected")
-            print("   - No other program is using the port")
+            
+        except PermissionError as e:
+            print(f"\n❌ Permission Error: Port {self.port} tidak dapat diakses")
+            print("💡 Kemungkinan penyebab:")
+            print("   1. Port sedang digunakan oleh program lain (Arduino IDE, Serial Monitor, dll)")
+            print("   2. Tutup semua program yang menggunakan port ini")
+            print("   3. Coba restart komputer jika masalah tetap ada")
+            print("\n🔍 Program yang mungkin menggunakan port:")
+            print("   - Arduino IDE dengan Serial Monitor terbuka")
+            print("   - Terminal/PowerShell lain yang membaca serial")
+            print("   - Program Python lain yang menggunakan port ini")
+            print("   - Device Manager - uninstall/reinstall driver jika perlu")
             return False
+            
+        except serial.SerialException as e:
+            print(f"\n❌ Serial connection error: {e}")
+            print("💡 Checklist troubleshooting:")
+            print("   ✓ ESP32 terhubung via USB")
+            print("   ✓ Driver ESP32 sudah terinstall (CH340/CP2102)")
+            print("   ✓ Port COM yang benar (lihat daftar di atas)")
+            print("   ✓ Tidak ada program lain yang menggunakan port")
+            print("   ✓ Kabel USB tidak rusak")
+            return False
+            
         except Exception as e:
-            print(f"❌ Unexpected error connecting to ESP32: {e}")
+            print(f"\n❌ Unexpected error connecting to ESP32: {e}")
+            print(f"   Error type: {type(e).__name__}")
             return False
     
     def parse_esp32_data(self, data_line):
         """
         Parse data dari ESP32 dalam format:
-        ESP32 Raw: 226 | Raspberry Compatible: 3613.35 | Normalized: 0.0552
+        Format 1: SENSOR_DATA,val1,val2,val3,val4,val5,val6,val7,val8
+        Format 2: ESP32 Raw: 226 | Raspberry Compatible: 3613.35 | Normalized: 0.0552
         """
         try:
-            # Extract normalized value menggunakan regex
+            # Cek apakah format SENSOR_DATA (format baru dengan 8 nilai sekaligus)
+            if data_line.startswith("SENSOR_DATA"):
+                # Parse format: SENSOR_DATA,val1,val2,val3,val4,val5,val6,val7,val8
+                parts = data_line.split(",")
+                if len(parts) == 9:  # SENSOR_DATA + 8 values
+                    values = []
+                    for i in range(1, 9):  # Skip "SENSOR_DATA"
+                        try:
+                            values.append(float(parts[i]))
+                        except ValueError:
+                            print(f"⚠️ Invalid value at index {i}: {parts[i]}")
+                            return None
+                    return values  # Return list of 8 values
+                else:
+                    print(f"⚠️ Invalid SENSOR_DATA format. Expected 9 parts, got {len(parts)}")
+                    return None
+            
+            # Format lama: Extract normalized value menggunakan regex
             pattern = r'Normalized:\s*([0-9.]+)'
             match = re.search(pattern, data_line)
             
@@ -259,44 +323,89 @@ class ESP32BidirectionalProcessor:
             while True:
                 if self.serial_conn.in_waiting > 0:
                     # Read data from ESP32
-                    data_line = self.serial_conn.readline().decode('utf-8').strip()
+                    try:
+                        data_line = self.serial_conn.readline().decode('utf-8').strip()
+                    except UnicodeDecodeError:
+                        print("⚠️ Unicode decode error, skipping line")
+                        continue
+                    
+                    # Skip empty lines atau debug lines yang tidak relevan
+                    if not data_line or data_line.startswith("Raw values:") or data_line.startswith("ESP32 Sensor"):
+                        if data_line:
+                            print(f"🔍 Debug line (ignored): {data_line[:50]}...")
+                        continue
+                    
+                    # Debug: tampilkan raw data
+                    if len(data_line) > 0:
+                        print(f"🔍 Raw data received: {data_line[:100]}...")
                     
                     # Parse data ESP32
-                    normalized_value = self.parse_esp32_data(data_line)
+                    parsed_data = self.parse_esp32_data(data_line)
                     
-                    if normalized_value is not None:
-                        # Tambahkan ke buffer
-                        self.sensor_buffer.append(normalized_value)
-                        
-                        print(f"📥 Sensor data received: {normalized_value:.6f} (Buffer: {len(self.sensor_buffer)}/8)")
-                        
-                        # Check jika sudah ada 8 data
-                        if len(self.sensor_buffer) >= 8:
-                            sensor_data = self.collect_sensor_data()
+                    if parsed_data is not None:
+                        # Cek apakah hasil parse adalah list (format baru: 8 nilai sekaligus)
+                        if isinstance(parsed_data, list) and len(parsed_data) == 8:
+                            # Format baru: langsung dapat 8 nilai
+                            sensor_data = np.array(parsed_data, dtype=np.float32)
+                            print(f"📥 Sensor data received (complete set): {len(parsed_data)} values")
                             
-                            if sensor_data is not None:
-                                data_count += 1
+                            data_count += 1
+                            
+                            # Store data
+                            self.sensor_data_log.append(sensor_data.copy())
+                            
+                            # Run inference
+                            prediction, confidence, probabilities = self.run_inference(sensor_data)
+                            
+                            if prediction is not None:
+                                # Display results
+                                self.display_sensor_data(sensor_data, prediction, confidence)
                                 
-                                # Store data
-                                self.sensor_data_log.append(sensor_data.copy())
+                                # Send prediction to ESP32
+                                self.send_prediction_to_esp32(prediction, confidence)
                                 
-                                # Run inference
-                                prediction, confidence, probabilities = self.run_inference(sensor_data)
+                                # Save to CSV if enabled
+                                if self.save_to_file:
+                                    self.save_data_to_csv(sensor_data, prediction, confidence)
                                 
-                                if prediction is not None:
-                                    # Display results
-                                    self.display_sensor_data(sensor_data, prediction, confidence)
+                                print(f"📝 Complete dataset #{data_count}")
+                                print(f"💾 Saved to: {self.csv_filename}")
+                                print("=" * 80)
+                                
+                        else:
+                            # Format lama: single value, tambahkan ke buffer
+                            self.sensor_buffer.append(parsed_data)
+                            print(f"📥 Sensor data received: {parsed_data:.6f} (Buffer: {len(self.sensor_buffer)}/8)")
+                            
+                            # Check jika sudah ada 8 data
+                            if len(self.sensor_buffer) >= 8:
+                                sensor_data = self.collect_sensor_data()
+                                
+                                if sensor_data is not None:
+                                    data_count += 1
                                     
-                                    # Send prediction to ESP32
-                                    self.send_prediction_to_esp32(prediction, confidence)
+                                    # Store data
+                                    self.sensor_data_log.append(sensor_data.copy())
                                     
-                                    # Save to CSV if enabled
-                                    if self.save_to_file:
-                                        self.save_data_to_csv(sensor_data, prediction, confidence)
+                                    # Run inference
+                                    prediction, confidence, probabilities = self.run_inference(sensor_data)
                                     
-                                    print(f"📝 Complete dataset #{data_count}")
-                                    print(f"💾 Saved to: {self.csv_filename}")
-                                    print("=" * 80)
+                                    if prediction is not None:
+                                        # Display results
+                                        self.display_sensor_data(sensor_data, prediction, confidence)
+                                        
+                                        # Send prediction to ESP32
+                                        self.send_prediction_to_esp32(prediction, confidence)
+                                        
+                                        # Save to CSV if enabled
+                                        if self.save_to_file:
+                                            self.save_data_to_csv(sensor_data, prediction, confidence)
+                                        
+                                        print(f"📝 Complete dataset #{data_count}")
+                                        print(f"💾 Saved to: {self.csv_filename}")
+                                        print("=" * 80)
+                    else:
+                        print(f"⚠️ Failed to parse data: {data_line[:80]}...")
                 
                 time.sleep(0.1)  # Small delay
                 
