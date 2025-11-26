@@ -1,21 +1,24 @@
 // ESP32 Sensor Data Sender + LCD Display untuk Prediksi
-// Kirim data sensor ke laptop dan terima hasil prediksi untuk ditampilkan di LCD
+// Kirim data sensor ke laptop via WiFi REST API dan terima hasil prediksi untuk ditampilkan di LCD
 
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
-// Pin definitions untuk 8 sensor MQ
-int sensorPins[8] = {34, 35, 32, 33, 25, 26, 27, 14};
-String sensorNames[8] = {"MQ2", "MQ3", "MQ4", "MQ135", "MQ6", "MQ7", "MQ8", "MQ9"};
+// Pin definitions untuk 2 sensor MQ
+int sensorPins[2] = {34, 33};
+String sensorNames[2] = {"MQ2", "MQ3"};
 
 // Array untuk mencatat sensor yang terhubung
-bool sensorConnected[8] = {false, false, false, false, false, false, false, false};
+bool sensorConnected[2] = {false, false};
 
 // Konstanta normalisasi
 const int MAX_ESP32_ADC = 4095;
 const int MAX_RASPBERRY_MCP = 65472;
 
-// Threshold untuk deteksi sensor
+// Threshold untuk deteksi sensor (tidak digunakan lagi, selalu baca pin 34)
 const int SENSOR_CHECK_SAMPLES = 10;
 const int SENSOR_VARIATION_THRESHOLD = 50; // Minimum variasi untuk menganggap sensor terhubung
 
@@ -24,6 +27,24 @@ LiquidCrystal_I2C lcd(0x27, 16, 2); // Address, Columns, Rows
 bool lcdConnected = false; // Flag untuk status koneksi LCD
 int lcdAddress = 0x27; // Address LCD yang digunakan
 
+// WiFi Configuration - UBAH SESUAI JARINGAN ANDA
+const char* ssid = "S20FE";           // Ganti dengan SSID WiFi Anda
+const char* password = "pppppppp";   // Ganti dengan password WiFi Anda
+
+// Server Configuration - UBAH SESUAI IP LAPTOP ANDA
+const char* serverURL = "http://10.100.98.250:5000/api/sensor-data";  // Ganti dengan IP laptop Anda
+
+// WiFi status
+bool wifiConnected = false;
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL = 30000; // 30 seconds
+
+// Boot and watchdog
+unsigned long bootTime = 0;
+bool systemReady = false;
+unsigned long lastWatchdogFeed = 0;
+const unsigned long WATCHDOG_FEED_INTERVAL = 10000; // Feed watchdog every 10 seconds
+
 // Variabel untuk prediksi
 String predictionResult = "Waiting...";
 String confidenceStr = "";
@@ -31,45 +52,111 @@ unsigned long lastPredictionTime = 0;
 bool newPrediction = false;
 
 void setup() {
+  // CRITICAL: Delay lebih lama untuk memastikan boot sequence complete
+  // Terutama penting saat boot tanpa USB (hanya Vin)
+  delay(3000);  // Delay awal untuk stabilisasi power (diperpanjang ke 3 detik)
+  
+  // Initialize Serial - NON-BLOCKING
+  // Jangan tunggu Serial ready karena bisa block saat tidak ada USB
   Serial.begin(115200);
+  delay(100); // Small delay untuk Serial init, tapi tidak block
+  
+  // Tambahan delay untuk memastikan semua peripheral ready
   delay(1000);
   
-  // Initialize I2C dan cek LCD
-  Wire.begin();
-  checkLCDConnection();
+  bootTime = millis();
   
+  // Print boot info (jika Serial available)
+  if(Serial) {
+    Serial.println("\n\n==========================================");
+    Serial.println("ESP32 Sensor + LCD + WiFi REST API");
+    Serial.println("==========================================");
+    Serial.print("Boot time: ");
+    Serial.print(bootTime);
+    Serial.println(" ms");
+    Serial.println("Watchdog: Using software watchdog (feed in loop)");
+  }
+  
+  // Initialize I2C FIRST (sebelum WiFi) untuk memastikan hardware ready
+  Wire.begin();
+  delay(100);
+  
+  // Initialize LCD early untuk status display
+  checkLCDConnection();
   if(lcdConnected) {
-    // Initialize LCD dengan error handling
     Wire.beginTransmission(lcdAddress);
     byte error = Wire.endTransmission();
     if(error == 0) {
       lcd.init();
       lcd.backlight();
       safeLCDClear();
-      
-      // Display startup message
       safeLCDSetCursor(0, 0);
-      safeLCDPrint("Food Quality");
+      safeLCDPrint("Booting...");
       safeLCDSetCursor(0, 1);
-      safeLCDPrint("Assessment");
-      delay(2000);
-      
-      // Cek sensor yang terhubung
-      safeLCDClear();
-      safeLCDSetCursor(0, 0);
-      safeLCDPrint("Checking");
-      safeLCDSetCursor(0, 1);
-      safeLCDPrint("sensors...");
-      delay(500);
-    } else {
-      Serial.println("Error: LCD tidak merespon setelah init");
-      lcdConnected = false;
+      safeLCDPrint("Please wait");
     }
-  } else {
-    Serial.println("LCD tidak terhubung - hanya output ke Serial Monitor");
   }
   
-  checkConnectedSensors();
+  // Connect to WiFi dengan retry yang lebih robust
+  // CRITICAL: Pastikan WiFi connect sebelum lanjut
+  connectToWiFi();
+  
+  // Jika WiFi belum connect, coba sekali lagi dengan delay lebih lama
+  if(!wifiConnected) {
+    if(lcdConnected) {
+      safeLCDClear();
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("WiFi Retry...");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Wait 5 sec");
+    }
+    delay(5000); // Tunggu 5 detik sebelum retry
+    connectToWiFi();
+  }
+  
+  // LCD sudah di-init di atas, sekarang update display
+  if(lcdConnected) {
+    safeLCDClear();
+    safeLCDSetCursor(0, 0);
+    safeLCDPrint("Food Quality");
+    safeLCDSetCursor(0, 1);
+    safeLCDPrint("Assessment");
+    delay(1000);
+    
+    // Display WiFi status
+    safeLCDClear();
+    safeLCDSetCursor(0, 0);
+    if(wifiConnected) {
+      safeLCDPrint("WiFi: OK");
+      safeLCDSetCursor(0, 1);
+      String ipStr = WiFi.localIP().toString();
+      // Tampilkan 2 octet terakhir IP
+      int lastDot = ipStr.lastIndexOf('.');
+      int secondLastDot = ipStr.lastIndexOf('.', lastDot - 1);
+      if(secondLastDot > 0) {
+        safeLCDPrint(ipStr.substring(secondLastDot + 1));
+      } else {
+        safeLCDPrint("Connected");
+      }
+    } else {
+      safeLCDPrint("WiFi: FAIL");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Will retry...");
+    }
+    delay(2000);
+  }
+  
+  // Set sensor sebagai terhubung (pin analog selalu bisa dibaca)
+  sensorConnected[0] = true; // Pin 34 - MQ2
+  sensorConnected[1] = true; // Pin 33 - MQ3
+  
+  // Test baca kedua pin untuk verifikasi
+  int testValue1 = analogRead(sensorPins[0]);
+  int testValue2 = analogRead(sensorPins[1]);
+  Serial.print("Test read pin 34 (MQ2): ");
+  Serial.println(testValue1);
+  Serial.print("Test read pin 33 (MQ3): ");
+  Serial.println(testValue2);
   
   if(lcdConnected) {
     // Display hasil deteksi sensor
@@ -85,60 +172,139 @@ void setup() {
     safeLCDPrint("Waiting for AI");
   }
   
-  Serial.println("ESP32 Sensor + LCD Ready");
-  Serial.println("Format: SENSOR_DATA,val1,val2,val3,val4,val5,val6,val7,val8");
-  Serial.println("Sending test data every 3 seconds...");
+  // Mark system as ready
+  systemReady = true;
+  unsigned long setupTime = millis() - bootTime;
+  
+  if(Serial) {
+    Serial.println("\n==========================================");
+    Serial.println("ESP32 Sensor + LCD Ready");
+    Serial.print("Setup completed in: ");
+    Serial.print(setupTime);
+    Serial.println(" ms");
+    
+    if(wifiConnected) {
+      Serial.print("Server URL: ");
+      Serial.println(serverURL);
+      Serial.println("Sending data via HTTP POST every 3 seconds...");
+    } else {
+      Serial.println("⚠️ WiFi not connected - will retry in loop");
+    }
+    Serial.println("==========================================\n");
+  }
+  
+  // Update LCD dengan status final
+  if(lcdConnected) {
+    safeLCDClear();
+    if(wifiConnected) {
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("Ready!");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Sending data...");
+    } else {
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("WiFi Error");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Retrying...");
+    }
+  }
 }
 
 void loop() {
-  // Baca hanya sensor yang terhubung
-  float sensorValues[8];
-  for(int i = 0; i < 8; i++) {
-    if(sensorConnected[i]) {
-      sensorValues[i] = analogRead(sensorPins[i]);
-    } else {
-      // Jika sensor tidak terhubung, gunakan nilai 0
-      sensorValues[i] = 0;
+  // Software watchdog: check jika loop stuck lebih dari 30 detik
+  unsigned long currentTime = millis();
+  if(currentTime - lastWatchdogFeed > 30000) {
+    // Jika lebih dari 30 detik tanpa feed, kemungkinan stuck
+    Serial.println("⚠️ Warning: Loop may be stuck, resetting...");
+    delay(100);
+    ESP.restart(); // Soft reset
+  }
+  lastWatchdogFeed = currentTime;
+  
+  // Pastikan system sudah ready
+  if(!systemReady) {
+    delay(100);
+    return;
+  }
+  
+  // Check WiFi connection and reconnect if needed
+  // CRITICAL: Pastikan WiFi selalu connect sebelum kirim data
+  if(WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    unsigned long currentTime = millis();
+    if(currentTime - lastWiFiReconnectAttempt >= WIFI_RECONNECT_INTERVAL) {
+      if(Serial) {
+        Serial.println("\n⚠️ WiFi disconnected. Attempting to reconnect...");
+      }
+      if(lcdConnected) {
+        safeLCDClear();
+        safeLCDSetCursor(0, 0);
+        safeLCDPrint("WiFi Lost!");
+        safeLCDSetCursor(0, 1);
+        safeLCDPrint("Reconnecting...");
+      }
+      connectToWiFi();
+      lastWiFiReconnectAttempt = currentTime;
     }
+  } else {
+    // WiFi connected - update flag
+    if(!wifiConnected) {
+      wifiConnected = true;
+      if(Serial) {
+        Serial.println("✅ WiFi connected!");
+      }
+      if(lcdConnected) {
+        safeLCDClear();
+        safeLCDSetCursor(0, 0);
+        safeLCDPrint("WiFi: OK");
+        safeLCDSetCursor(0, 1);
+        safeLCDPrint("Connected!");
+        delay(1000);
+      }
+    }
+  }
+  
+  // Baca pin analog 34 dan 33 (selalu baca, tidak perlu cek sensorConnected)
+  float sensorValues[2];
+  for(int i = 0; i < 2; i++) {
+    sensorValues[i] = analogRead(sensorPins[i]);
     delay(10); // Small delay between readings
   }
   
   // Normalisasi data untuk kompatibilitas dengan model Raspberry Pi
-  float normalizedValues[8];
-  for(int i = 0; i < 8; i++) {
-    if(sensorConnected[i]) {
-      float raspberryCompatible = (sensorValues[i] / MAX_ESP32_ADC) * MAX_RASPBERRY_MCP;
-      normalizedValues[i] = raspberryCompatible / MAX_RASPBERRY_MCP;
-    } else {
-      normalizedValues[i] = 0.0; // Sensor tidak terhubung = 0
-    }
+  float normalizedValues[2];
+  for(int i = 0; i < 2; i++) {
+    float raspberryCompatible = (sensorValues[i] / MAX_ESP32_ADC) * MAX_RASPBERRY_MCP;
+    normalizedValues[i] = raspberryCompatible / MAX_RASPBERRY_MCP;
   }
   
-  // Kirim data dalam format CSV
-  String dataString = "SENSOR_DATA";
-  for(int i = 0; i < 8; i++) {
-    dataString += ",";
-    dataString += String(normalizedValues[i], 6); // 6 decimal places
-  }
-  
-  Serial.println(dataString);
-  
-  // Debug info - tampilkan raw values juga (hanya yang terhubung)
-  Serial.print("Raw values: ");
-  for(int i = 0; i < 8; i++) {
-    Serial.print(sensorNames[i]);
-    if(sensorConnected[i]) {
+  // Debug info - tampilkan raw values (jika Serial available)
+  if(Serial) {
+    Serial.print("Raw values: ");
+    for(int i = 0; i < 2; i++) {
+      Serial.print(sensorNames[i]);
       Serial.print(":");
       Serial.print(sensorValues[i]);
-    } else {
-      Serial.print(":DISCONNECTED");
+      Serial.print(" ");
     }
-    Serial.print(" ");
+    Serial.println();
   }
-  Serial.println();
   
-  // Check for incoming prediction data
-  checkForPrediction();
+  // CRITICAL: Kirim data via HTTP POST jika WiFi terhubung
+  // Jangan skip hanya karena Serial tidak available
+  if(wifiConnected && WiFi.status() == WL_CONNECTED) {
+    sendSensorDataViaHTTP(normalizedValues);
+  } else {
+    if(Serial) {
+      Serial.println("⚠️ Skipping HTTP request - WiFi not connected");
+    }
+    if(lcdConnected) {
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("No WiFi");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Retrying...");
+    }
+  }
   
   // Update LCD display
   updateLCD();
@@ -217,7 +383,7 @@ void safeLCDPrint(String text) {
 void checkConnectedSensors() {
   Serial.println("\n=== Checking Connected Sensors ===");
   
-  for(int i = 0; i < 8; i++) {
+  for(int i = 0; i < 2; i++) {
     int readings[SENSOR_CHECK_SAMPLES];
     int minVal = 4095;
     int maxVal = 0;
@@ -265,7 +431,7 @@ void checkConnectedSensors() {
   // Tampilkan ringkasan
   Serial.println("\n=== Sensor Status Summary ===");
   int connectedCount = 0;
-  for(int i = 0; i < 8; i++) {
+  for(int i = 0; i < 2; i++) {
     if(sensorConnected[i]) {
       connectedCount++;
       Serial.print(sensorNames[i]);
@@ -274,34 +440,206 @@ void checkConnectedSensors() {
   }
   Serial.print("\nTotal connected: ");
   Serial.print(connectedCount);
-  Serial.println(" out of 8\n");
+  Serial.println(" out of 2\n");
 }
 
-void checkForPrediction() {
-  // Check if there's data from laptop
-  if(Serial.available() > 0) {
-    String incomingData = Serial.readStringUntil('\n');
-    incomingData.trim();
+void connectToWiFi() {
+  if(Serial) {
+    Serial.println("\n=== Connecting to WiFi ===");
+    Serial.print("SSID: ");
+    Serial.println(ssid);
+  }
+  
+  // Disconnect previous connection if any
+  WiFi.disconnect(true);
+  delay(1000); // Delay lebih lama untuk memastikan disconnect complete
+  
+  // Set WiFi mode
+  WiFi.mode(WIFI_STA);
+  
+  // Set WiFi power to maximum (untuk range yang lebih baik)
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  
+  // Start connection
+  WiFi.begin(ssid, password);
+  
+  // Retry dengan timeout yang lebih lama (40 detik untuk boot tanpa USB)
+  int attempts = 0;
+  int maxAttempts = 80;  // 80 x 500ms = 40 detik
+  
+  while(WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+    delay(500);
+    if(Serial) {
+      Serial.print(".");
+    }
+    attempts++;
     
-    // Parse prediction data
-    // Format expected: PREDICTION,class,confidence
-    if(incomingData.startsWith("PREDICTION,")) {
-      int firstComma = incomingData.indexOf(',');
-      int secondComma = incomingData.indexOf(',', firstComma + 1);
+    // Update LCD setiap 5 detik
+    if(lcdConnected && attempts % 10 == 0) {
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Connecting...");
+    }
+  }
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    if(Serial) {
+      Serial.println("\n✅ WiFi Connected!");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("Signal Strength (RSSI): ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+      Serial.print("Connection time: ");
+      Serial.print(attempts * 500);
+      Serial.println(" ms");
+    }
+    
+    if(lcdConnected) {
+      safeLCDClear();
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("WiFi: OK");
+      safeLCDSetCursor(0, 1);
+      String ipStr = WiFi.localIP().toString();
+      // Show last 2 octets of IP
+      int lastDot = ipStr.lastIndexOf('.');
+      int secondLastDot = ipStr.lastIndexOf('.', lastDot - 1);
+      if(secondLastDot > 0) {
+        safeLCDPrint(ipStr.substring(secondLastDot + 1));
+      } else {
+        safeLCDPrint("Connected");
+      }
+      delay(2000);
+    }
+  } else {
+    wifiConnected = false;
+    if(Serial) {
+      Serial.println("\n❌ WiFi Connection Failed!");
+      Serial.print("Attempted for: ");
+      Serial.print(attempts * 500);
+      Serial.println(" ms");
+      Serial.println("Please check:");
+      Serial.println("1. SSID and password are correct");
+      Serial.println("2. WiFi router is powered on");
+      Serial.println("3. ESP32 is within range");
+      Serial.println("4. Will retry in 30 seconds...");
+    }
+    
+    if(lcdConnected) {
+      safeLCDClear();
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("WiFi: FAIL");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Retry in 30s");
+    }
+  }
+  if(Serial) {
+    Serial.println();
+  }
+}
+
+void sendSensorDataViaHTTP(float normalizedValues[2]) {
+  if(!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  
+  HTTPClient http;
+  
+  // Prepare JSON payload
+  StaticJsonDocument<200> doc;
+  doc["sensors"] = JsonArray();
+  for(int i = 0; i < 2; i++) {
+    doc["sensors"].add(normalizedValues[i]);
+  }
+  
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  
+  if(Serial) {
+    Serial.print("📤 Sending HTTP POST to: ");
+    Serial.println(serverURL);
+    Serial.print("Payload: ");
+    Serial.println(jsonPayload);
+  }
+  
+  // Start HTTP connection
+  http.begin(serverURL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000); // 15 second timeout (lebih lama untuk network yang lambat)
+  http.setConnectTimeout(8000); // 8 second connection timeout
+  
+  // Send POST request
+  int httpResponseCode = http.POST(jsonPayload);
+  
+  if(httpResponseCode > 0) {
+    if(Serial) {
+      Serial.print("✅ HTTP Response code: ");
+      Serial.println(httpResponseCode);
+    }
+    
+    if(httpResponseCode == 200) {
+      String response = http.getString();
+      if(Serial) {
+        Serial.print("📥 Response: ");
+        Serial.println(response);
+      }
       
-      if(firstComma != -1 && secondComma != -1) {
-        String classStr = incomingData.substring(firstComma + 1, secondComma);
-        String confidence = incomingData.substring(secondComma + 1);
-        
-        // Convert class to readable text
-        predictionResult = interpretPrediction(classStr);
-        confidenceStr = confidence;
-        newPrediction = true;
-        lastPredictionTime = millis();
-        
-        Serial.println("Received prediction: " + predictionResult + " (" + confidenceStr + ")");
+      // Parse JSON response
+      parsePredictionResponse(response);
+    } else {
+      if(Serial) {
+        Serial.print("⚠️ HTTP Error: ");
+        Serial.println(httpResponseCode);
+        Serial.print("Response: ");
+        Serial.println(http.getString());
       }
     }
+  } else {
+    if(Serial) {
+      Serial.print("❌ HTTP Request failed: ");
+      Serial.println(http.errorToString(httpResponseCode));
+    }
+    
+    // Update LCD dengan error status
+    if(lcdConnected) {
+      safeLCDSetCursor(0, 0);
+      safeLCDPrint("HTTP Error");
+      safeLCDSetCursor(0, 1);
+      safeLCDPrint("Retrying...");
+    }
+  }
+  
+  http.end();
+}
+
+void parsePredictionResponse(String jsonResponse) {
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, jsonResponse);
+  
+  if(error) {
+    Serial.print("❌ JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // Extract prediction and confidence from JSON
+  if(doc.containsKey("prediction") && doc.containsKey("confidence")) {
+    int predictionClass = doc["prediction"];
+    float confidence = doc["confidence"];
+    
+    // Convert class to readable text
+    predictionResult = interpretPrediction(String(predictionClass));
+    confidenceStr = String(confidence, 3);
+    newPrediction = true;
+    lastPredictionTime = millis();
+    
+    Serial.print("✅ Received prediction: ");
+    Serial.print(predictionResult);
+    Serial.print(" (");
+    Serial.print(confidenceStr);
+    Serial.println(")");
+  } else {
+    Serial.println("⚠️ Invalid response format - missing prediction or confidence");
   }
 }
 

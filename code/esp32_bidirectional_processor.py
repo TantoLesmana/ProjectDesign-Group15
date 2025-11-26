@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-ESP32 Bidirectional Communication - Sensor Data + Prediction Results
-Menerima data sensor dari ESP32, jalankan inference, kirim hasil prediksi kembali ke ESP32
+ESP32 Bidirectional Communication via REST API - Sensor Data + Prediction Results
+Menerima data sensor dari ESP32 via HTTP POST, jalankan inference, kirim hasil prediksi kembali via JSON response
 """
 
-import serial
-import serial.tools.list_ports
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import numpy as np
 import time
 import sys
 from datetime import datetime
 import csv
 import json
-import re
+import socket
 
 # TensorFlow Lite import
 try:
@@ -23,33 +23,31 @@ except ImportError:
     TFLITE_AVAILABLE = False
 
 class ESP32BidirectionalProcessor:
-    def __init__(self, port='COM3', baudrate=115200, model_path='food_model_250.tflite', save_to_file=True):
+    def __init__(self, host='0.0.0.0', port=5000, model_path='food_model_250.tflite', save_to_file=True):
         """
-        Inisialisasi processor untuk komunikasi dua arah dengan ESP32
+        Inisialisasi processor untuk komunikasi dua arah dengan ESP32 via REST API
         
         Args:
-            port: Port serial ESP32 (Windows: COM3, Linux: /dev/ttyUSB0)
-            baudrate: Baud rate komunikasi serial
+            host: Host untuk Flask server (0.0.0.0 untuk listen semua interface)
+            port: Port untuk Flask server (default: 5000)
             model_path: Path ke file model TensorFlow Lite
             save_to_file: Apakah data disimpan ke file
         """
+        self.host = host
         self.port = port
-        self.baudrate = baudrate
         self.model_path = model_path
         self.save_to_file = save_to_file
         
-        # Setup serial connection
-        self.serial_conn = None
+        # Flask app setup
+        self.app = Flask(__name__)
+        CORS(self.app)  # Enable CORS untuk cross-origin requests
         
         # Data storage
         self.sensor_data_log = []
         self.csv_filename = f"sensor_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         
-        # Sensor names untuk display
-        self.sensor_names = ["MQ2", "MQ3", "MQ4", "MQ135", "MQ6", "MQ7", "MQ8", "MQ9"]
-        
-        # Buffer untuk data sensor
-        self.sensor_buffer = []
+        # Sensor names untuk display (sesuai dengan ESP32 yang hanya punya 2 sensor)
+        self.sensor_names = ["MQ2", "MQ3"]
         
         # TensorFlow Lite setup
         self.interpreter = None
@@ -65,6 +63,12 @@ class ESP32BidirectionalProcessor:
         # Setup CSV file jika diperlukan
         if self.save_to_file:
             self.setup_csv_file()
+        
+        # Setup Flask routes
+        self.setup_routes()
+        
+        # Request counter
+        self.request_count = 0
     
     def setup_model(self):
         """Setup TensorFlow Lite model"""
@@ -96,135 +100,144 @@ class ESP32BidirectionalProcessor:
         except Exception as e:
             print(f"❌ Error creating CSV file: {e}")
     
-    def list_available_ports(self):
-        """List semua port serial yang tersedia"""
-        ports = serial.tools.list_ports.comports()
-        if not ports:
-            print("❌ No serial ports found")
-            return []
-        
-        print("\n📋 Available Serial Ports:")
-        print("-" * 60)
-        available_ports = []
-        for port, desc, hwid in sorted(ports):
-            print(f"  {port:10} - {desc}")
-            print(f"             HWID: {hwid}")
-            available_ports.append(port)
-        print("-" * 60)
-        return available_ports
-    
-    def connect_serial(self):
-        """Koneksi ke ESP32 via Serial"""
-        # List available ports first
-        available_ports = self.list_available_ports()
-        
-        if self.port not in available_ports:
-            print(f"\n⚠️ Port {self.port} tidak ditemukan dalam daftar port yang tersedia")
-            if available_ports:
-                print(f"💡 Port yang tersedia: {', '.join(available_ports)}")
-                print(f"💡 Coba gunakan salah satu port di atas atau ubah konfigurasi PORT")
-            return False
-        
+    def get_local_ip(self):
+        """Get local IP address untuk ditampilkan ke user"""
         try:
-            print(f"\n🔌 Attempting to connect to {self.port} at {self.baudrate} baud...")
-            self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=1)
-            time.sleep(2)  # Wait for connection
-            print(f"✅ Connected to ESP32 on {self.port}")
-            return True
-            
-        except PermissionError as e:
-            print(f"\n❌ Permission Error: Port {self.port} tidak dapat diakses")
-            print("💡 Kemungkinan penyebab:")
-            print("   1. Port sedang digunakan oleh program lain (Arduino IDE, Serial Monitor, dll)")
-            print("   2. Tutup semua program yang menggunakan port ini")
-            print("   3. Coba restart komputer jika masalah tetap ada")
-            print("\n🔍 Program yang mungkin menggunakan port:")
-            print("   - Arduino IDE dengan Serial Monitor terbuka")
-            print("   - Terminal/PowerShell lain yang membaca serial")
-            print("   - Program Python lain yang menggunakan port ini")
-            print("   - Device Manager - uninstall/reinstall driver jika perlu")
-            return False
-            
-        except serial.SerialException as e:
-            print(f"\n❌ Serial connection error: {e}")
-            print("💡 Checklist troubleshooting:")
-            print("   ✓ ESP32 terhubung via USB")
-            print("   ✓ Driver ESP32 sudah terinstall (CH340/CP2102)")
-            print("   ✓ Port COM yang benar (lihat daftar di atas)")
-            print("   ✓ Tidak ada program lain yang menggunakan port")
-            print("   ✓ Kabel USB tidak rusak")
-            return False
-            
-        except Exception as e:
-            print(f"\n❌ Unexpected error connecting to ESP32: {e}")
-            print(f"   Error type: {type(e).__name__}")
-            return False
+            # Connect to external server untuk mendapatkan local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
     
-    def parse_esp32_data(self, data_line):
-        """
-        Parse data dari ESP32 dalam format:
-        Format 1: SENSOR_DATA,val1,val2,val3,val4,val5,val6,val7,val8
-        Format 2: ESP32 Raw: 226 | Raspberry Compatible: 3613.35 | Normalized: 0.0552
-        """
-        try:
-            # Cek apakah format SENSOR_DATA (format baru dengan 8 nilai sekaligus)
-            if data_line.startswith("SENSOR_DATA"):
-                # Parse format: SENSOR_DATA,val1,val2,val3,val4,val5,val6,val7,val8
-                parts = data_line.split(",")
-                if len(parts) == 9:  # SENSOR_DATA + 8 values
-                    values = []
-                    for i in range(1, 9):  # Skip "SENSOR_DATA"
-                        try:
-                            values.append(float(parts[i]))
-                        except ValueError:
-                            print(f"⚠️ Invalid value at index {i}: {parts[i]}")
-                            return None
-                    return values  # Return list of 8 values
-                else:
-                    print(f"⚠️ Invalid SENSOR_DATA format. Expected 9 parts, got {len(parts)}")
-                    return None
-            
-            # Format lama: Extract normalized value menggunakan regex
-            pattern = r'Normalized:\s*([0-9.]+)'
-            match = re.search(pattern, data_line)
-            
-            if match:
-                normalized_value = float(match.group(1))
-                return normalized_value
-            else:
-                return None
+    def setup_routes(self):
+        """Setup Flask routes untuk REST API"""
+        
+        @self.app.route('/api/sensor-data', methods=['POST'])
+        def receive_sensor_data():
+            """Endpoint untuk menerima data sensor dari ESP32"""
+            try:
+                # Parse JSON request
+                data = request.get_json()
                 
-        except Exception as e:
-            print(f"❌ Error parsing ESP32 data: {e}")
-            return None
+                if not data or 'sensors' not in data:
+                    return jsonify({
+                        'error': 'Invalid request format. Expected: {"sensors": [val1, val2]}'
+                    }), 400
+                
+                sensor_values = data['sensors']
+                
+                # Validate sensor data
+                if not isinstance(sensor_values, list):
+                    return jsonify({'error': 'sensors must be an array'}), 400
+                
+                if len(sensor_values) != 2:
+                    return jsonify({
+                        'error': f'Expected 2 sensor values, got {len(sensor_values)}'
+                    }), 400
+                
+                # Convert to numpy array
+                try:
+                    sensor_data = np.array(sensor_values, dtype=np.float32)
+                except (ValueError, TypeError) as e:
+                    return jsonify({'error': f'Invalid sensor values: {str(e)}'}), 400
+                
+                # Run inference
+                prediction, confidence, probabilities = self.run_inference(sensor_data)
+                
+                if prediction is None:
+                    return jsonify({'error': 'Inference failed'}), 500
+                
+                # Increment request counter
+                self.request_count += 1
+                
+                # Store data
+                self.sensor_data_log.append(sensor_data.copy())
+                
+                # Display results
+                self.display_sensor_data(sensor_data, prediction, confidence)
+                
+                # Save to CSV if enabled
+                if self.save_to_file:
+                    self.save_data_to_csv(sensor_data, prediction, confidence)
+                
+                # Return JSON response
+                response = {
+                    'success': True,
+                    'prediction': int(prediction),
+                    'confidence': float(confidence),
+                    'interpretation': self.interpret_prediction(prediction),
+                    'request_id': self.request_count
+                }
+                
+                print(f"📤 Sending response: {response}")
+                print("=" * 80)
+                
+                return jsonify(response), 200
+                
+            except Exception as e:
+                print(f"❌ Error processing request: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/health', methods=['GET'])
+        def health_check():
+            """Health check endpoint"""
+            return jsonify({
+                'status': 'healthy',
+                'model_loaded': self.interpreter is not None,
+                'total_requests': self.request_count,
+                'server_time': datetime.now().isoformat()
+            }), 200
+        
+        @self.app.route('/', methods=['GET'])
+        def index():
+            """Root endpoint dengan informasi server"""
+            local_ip = self.get_local_ip()
+            return jsonify({
+                'message': 'ESP32 Bidirectional AI Processor API',
+                'endpoints': {
+                    'POST /api/sensor-data': 'Send sensor data and get prediction',
+                    'GET /api/health': 'Health check'
+                },
+                'server_ip': local_ip,
+                'server_port': self.port,
+                'model_loaded': self.interpreter is not None
+            }), 200
     
-    def collect_sensor_data(self):
-        """Kumpulkan data dari 8 sensor"""
-        if len(self.sensor_buffer) >= 8:
-            # Ambil 8 data terbaru
-            sensor_data = np.array(self.sensor_buffer[-8:], dtype=np.float32)
-            self.sensor_buffer.clear()  # Clear buffer
-            return sensor_data
-        return None
     
     def run_inference(self, sensor_data):
         """
         Jalankan inference dengan TensorFlow Lite
         
         Args:
-            sensor_data: Array numpy dengan 8 nilai sensor
+            sensor_data: Array numpy dengan 2 nilai sensor (MQ2, MQ3)
             
         Returns:
             prediction: Prediksi kelas (0=fresh, 1=degraded, 2=error)
             confidence: Confidence score
+            probabilities: Array dengan semua probabilitas kelas
         """
         if self.interpreter is None:
             # Simulate prediction jika model tidak tersedia
             return 0, 0.85, np.array([0.85, 0.10, 0.05])
         
         try:
-            # Reshape data untuk model (batch_size=1, features=8)
+            # Reshape data untuk model (batch_size=1, features=2)
+            # Note: Model mungkin masih expect 8 features, perlu padding atau adjustment
+            # Untuk sekarang, kita asumsikan model bisa handle 2 features
             input_data = np.expand_dims(sensor_data, axis=0)
+            
+            # Jika model expect 8 features, pad dengan zeros
+            expected_features = self.input_details[0]['shape'][1]
+            if expected_features == 8 and len(sensor_data) == 2:
+                # Pad dengan zeros untuk 6 sensor lainnya
+                padded_data = np.zeros((1, 8), dtype=np.float32)
+                padded_data[0, 0] = sensor_data[0]  # MQ2
+                padded_data[0, 1] = sensor_data[1]  # MQ3
+                input_data = padded_data
+                print("⚠️ Model expects 8 features, padding with zeros for sensors 3-8")
             
             # Set input tensor
             self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
@@ -243,6 +256,8 @@ class ESP32BidirectionalProcessor:
             
         except Exception as e:
             print(f"❌ Error during inference: {e}")
+            import traceback
+            traceback.print_exc()
             return None, None, None
     
     def interpret_prediction(self, prediction):
@@ -254,16 +269,6 @@ class ESP32BidirectionalProcessor:
         }
         return interpretations.get(prediction, "UNKNOWN")
     
-    def send_prediction_to_esp32(self, prediction, confidence):
-        """Kirim hasil prediksi ke ESP32"""
-        try:
-            # Format: PREDICTION,class,confidence
-            prediction_str = f"PREDICTION,{prediction},{confidence:.3f}\n"
-            self.serial_conn.write(prediction_str.encode('utf-8'))
-            print(f"📤 Sent prediction to ESP32: {prediction} ({confidence:.3f})")
-            
-        except Exception as e:
-            print(f"❌ Error sending prediction to ESP32: {e}")
     
     def save_data_to_csv(self, sensor_data, prediction, confidence):
         """Simpan data ke CSV file"""
@@ -283,7 +288,7 @@ class ESP32BidirectionalProcessor:
         """Display data sensor dengan format yang rapi"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         
-        print(f"\n[{timestamp}] 📊 Sensor Data + Prediction:")
+        print(f"\n[{timestamp}] 📊 Sensor Data + Prediction (Request #{self.request_count}):")
         print("-" * 60)
         
         for i, (name, value) in enumerate(zip(self.sensor_names, sensor_data)):
@@ -306,120 +311,35 @@ class ESP32BidirectionalProcessor:
         
         print("-" * 60)
     
-    def process_sensor_data(self):
-        """Main loop untuk memproses data sensor"""
-        if not self.connect_serial():
-            return
+    def start_server(self):
+        """Start Flask REST API server"""
+        local_ip = self.get_local_ip()
         
-        print("\n🔄 Starting bidirectional sensor data processing...")
-        print("📝 Collecting data from 8 sensors...")
-        print("🤖 Running AI inference...")
-        print("📤 Sending predictions to ESP32...")
+        print("\n" + "=" * 80)
+        print("🤖 ESP32 Bidirectional AI Processor - REST API Server")
+        print("=" * 80)
+        print(f"📡 Server starting on: http://{self.host}:{self.port}")
+        print(f"🌐 Local IP Address: {local_ip}")
+        print(f"📋 ESP32 should connect to: http://{local_ip}:{self.port}/api/sensor-data")
+        print(f"💾 CSV file: {self.csv_filename}")
+        print(f"🤖 Model: {self.model_path} ({'✅ Loaded' if self.interpreter else '❌ Not loaded'})")
+        print("=" * 80)
+        print("\n🔄 Server is running...")
+        print("📝 Waiting for sensor data from ESP32...")
+        print("🤖 Running AI inference on each request...")
+        print("📤 Sending predictions back via JSON response...")
         print("Press Ctrl+C to stop\n")
         
-        data_count = 0
-        
         try:
-            while True:
-                if self.serial_conn.in_waiting > 0:
-                    # Read data from ESP32
-                    try:
-                        data_line = self.serial_conn.readline().decode('utf-8').strip()
-                    except UnicodeDecodeError:
-                        print("⚠️ Unicode decode error, skipping line")
-                        continue
-                    
-                    # Skip empty lines atau debug lines yang tidak relevan
-                    if not data_line or data_line.startswith("Raw values:") or data_line.startswith("ESP32 Sensor"):
-                        if data_line:
-                            print(f"🔍 Debug line (ignored): {data_line[:50]}...")
-                        continue
-                    
-                    # Debug: tampilkan raw data
-                    if len(data_line) > 0:
-                        print(f"🔍 Raw data received: {data_line[:100]}...")
-                    
-                    # Parse data ESP32
-                    parsed_data = self.parse_esp32_data(data_line)
-                    
-                    if parsed_data is not None:
-                        # Cek apakah hasil parse adalah list (format baru: 8 nilai sekaligus)
-                        if isinstance(parsed_data, list) and len(parsed_data) == 8:
-                            # Format baru: langsung dapat 8 nilai
-                            sensor_data = np.array(parsed_data, dtype=np.float32)
-                            print(f"📥 Sensor data received (complete set): {len(parsed_data)} values")
-                            
-                            data_count += 1
-                            
-                            # Store data
-                            self.sensor_data_log.append(sensor_data.copy())
-                            
-                            # Run inference
-                            prediction, confidence, probabilities = self.run_inference(sensor_data)
-                            
-                            if prediction is not None:
-                                # Display results
-                                self.display_sensor_data(sensor_data, prediction, confidence)
-                                
-                                # Send prediction to ESP32
-                                self.send_prediction_to_esp32(prediction, confidence)
-                                
-                                # Save to CSV if enabled
-                                if self.save_to_file:
-                                    self.save_data_to_csv(sensor_data, prediction, confidence)
-                                
-                                print(f"📝 Complete dataset #{data_count}")
-                                print(f"💾 Saved to: {self.csv_filename}")
-                                print("=" * 80)
-                                
-                        else:
-                            # Format lama: single value, tambahkan ke buffer
-                            self.sensor_buffer.append(parsed_data)
-                            print(f"📥 Sensor data received: {parsed_data:.6f} (Buffer: {len(self.sensor_buffer)}/8)")
-                            
-                            # Check jika sudah ada 8 data
-                            if len(self.sensor_buffer) >= 8:
-                                sensor_data = self.collect_sensor_data()
-                                
-                                if sensor_data is not None:
-                                    data_count += 1
-                                    
-                                    # Store data
-                                    self.sensor_data_log.append(sensor_data.copy())
-                                    
-                                    # Run inference
-                                    prediction, confidence, probabilities = self.run_inference(sensor_data)
-                                    
-                                    if prediction is not None:
-                                        # Display results
-                                        self.display_sensor_data(sensor_data, prediction, confidence)
-                                        
-                                        # Send prediction to ESP32
-                                        self.send_prediction_to_esp32(prediction, confidence)
-                                        
-                                        # Save to CSV if enabled
-                                        if self.save_to_file:
-                                            self.save_data_to_csv(sensor_data, prediction, confidence)
-                                        
-                                        print(f"📝 Complete dataset #{data_count}")
-                                        print(f"💾 Saved to: {self.csv_filename}")
-                                        print("=" * 80)
-                    else:
-                        print(f"⚠️ Failed to parse data: {data_line[:80]}...")
-                
-                time.sleep(0.1)  # Small delay
-                
+            # Run Flask server
+            self.app.run(host=self.host, port=self.port, debug=False, threaded=True)
         except KeyboardInterrupt:
-            print("\n🛑 Stopping data processing...")
-            print(f"📊 Total complete datasets processed: {data_count}")
-            print(f"📊 Partial data in buffer: {len(self.sensor_buffer)}")
-            
+            print("\n🛑 Stopping server...")
+            print(f"📊 Total requests processed: {self.request_count}")
         except Exception as e:
-            print(f"❌ Error in main loop: {e}")
-        finally:
-            if self.serial_conn:
-                self.serial_conn.close()
-                print("✅ Serial connection closed")
+            print(f"❌ Error running server: {e}")
+            import traceback
+            traceback.print_exc()
     
     def export_to_json(self, filename=None):
         """Export data ke JSON format"""
@@ -436,8 +356,8 @@ class ESP32BidirectionalProcessor:
                     'timestamp': datetime.now().isoformat(),
                     'total_samples': len(self.sensor_data_log),
                     'sensor_names': self.sensor_names,
+                    'host': self.host,
                     'port': self.port,
-                    'baudrate': self.baudrate,
                     'model_path': self.model_path
                 },
                 'data': [sensor_data.tolist() for sensor_data in self.sensor_data_log]
@@ -453,26 +373,25 @@ class ESP32BidirectionalProcessor:
 
 def main():
     """Main function"""
-    print("🤖 ESP32 Bidirectional AI Processor")
-    print("=" * 60)
-    
     # Konfigurasi - sesuaikan dengan setup Anda
-    PORT = 'COM3'  # Windows: COM3, Linux: /dev/ttyUSB0
+    HOST = '0.0.0.0'  # Listen pada semua network interface
+    PORT = 5000  # Port untuk Flask server
     MODEL_PATH = 'food_model_250.tflite'  # Path ke model TensorFlow Lite
     SAVE_TO_FILE = True  # Set False jika tidak ingin save ke file
     
     # Buat processor
     processor = ESP32BidirectionalProcessor(
+        host=HOST,
         port=PORT, 
         model_path=MODEL_PATH, 
         save_to_file=SAVE_TO_FILE
     )
     
-    # Mulai data processing
-    processor.process_sensor_data()
+    # Start REST API server
+    processor.start_server()
     
-    # Export to JSON setelah selesai
-    if SAVE_TO_FILE:
+    # Export to JSON setelah selesai (jika server dihentikan)
+    if SAVE_TO_FILE and processor.sensor_data_log:
         processor.export_to_json()
 
 if __name__ == "__main__":
