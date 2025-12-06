@@ -54,19 +54,21 @@ class ESP32BidirectionalProcessor:
         self.predictions_log = []
         self.max_data_points = 100  # Jumlah maksimum data point untuk chart
         
+        # Sensor names untuk 8 sensor
+        self.sensor_names = ["MQ2", "MQ3", "MQ4", "MQ135", "MQ6", "MQ7", "MQ8", "MQ9"]
+        self.num_sensors = len(self.sensor_names)
+        
         # Buffer untuk chart data (gunakan deque untuk performa)
         self.chart_data = {
             'timestamps': collections.deque(maxlen=self.max_data_points),
-            'mq2_values': collections.deque(maxlen=self.max_data_points),
-            'mq3_values': collections.deque(maxlen=self.max_data_points),
+            'sensor_values': {name: collections.deque(maxlen=self.max_data_points) for name in self.sensor_names},
             'predictions': collections.deque(maxlen=self.max_data_points),
             'confidences': collections.deque(maxlen=self.max_data_points)
         }
         
         # Data terbaru untuk real-time update
         self.latest_data = {
-            'mq2': 0.0,
-            'mq3': 0.0,
+            'sensors': {name: 0.0 for name in self.sensor_names},
             'prediction': 0,
             'confidence': 0.0,
             'interpretation': 'UNKNOWN',
@@ -80,14 +82,10 @@ class ESP32BidirectionalProcessor:
             'degraded_count': 0,
             'error_count': 0,
             'avg_confidence': 0.0,
-            'avg_mq2': 0.0,
-            'avg_mq3': 0.0
+            'avg_sensors': {name: 0.0 for name in self.sensor_names}
         }
         
         self.csv_filename = f"sensor_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        # Sensor names untuk display (sesuai dengan ESP32 yang hanya punya 2 sensor)
-        self.sensor_names = ["MQ2", "MQ3"]
         
         # TensorFlow Lite setup
         self.interpreter = None
@@ -129,6 +127,10 @@ class ESP32BidirectionalProcessor:
             print(f"Input shape: {self.input_details[0]['shape']}")
             print(f"Output shape: {self.output_details[0]['shape']}")
             
+            # Check model input dimensions
+            expected_features = self.input_details[0]['shape'][1]
+            print(f"Model expects {expected_features} features")
+            
         except Exception as e:
             print(f"❌ Error loading model: {e}")
             print("⚠️ Continuing without model inference")
@@ -167,7 +169,8 @@ class ESP32BidirectionalProcessor:
             return render_template('index.html', 
                                  host=self.host,
                                  port=self.port,
-                                 sensor_names=self.sensor_names)
+                                 sensor_names=self.sensor_names,
+                                 num_sensors=self.num_sensors)
         
         @self.app.route('/api/sensor-data', methods=['POST'])
         def receive_sensor_data():
@@ -178,7 +181,7 @@ class ESP32BidirectionalProcessor:
                 
                 if not data or 'sensors' not in data:
                     return jsonify({
-                        'error': 'Invalid request format. Expected: {"sensors": [val1, val2]}'
+                        'error': f'Invalid request format. Expected: {{"sensors": [val1, val2, ..., val{self.num_sensors}]}}'
                     }), 400
                 
                 sensor_values = data['sensors']
@@ -187,9 +190,9 @@ class ESP32BidirectionalProcessor:
                 if not isinstance(sensor_values, list):
                     return jsonify({'error': 'sensors must be an array'}), 400
                 
-                if len(sensor_values) != 2:
+                if len(sensor_values) != self.num_sensors:
                     return jsonify({
-                        'error': f'Expected 2 sensor values, got {len(sensor_values)}'
+                        'error': f'Expected {self.num_sensors} sensor values, got {len(sensor_values)}'
                     }), 400
                 
                 # Convert to numpy array
@@ -219,10 +222,11 @@ class ESP32BidirectionalProcessor:
                     current_time = datetime.now()
                     timestamp_str = current_time.strftime("%H:%M:%S")
                     
-                    # Convert numpy values to Python native types
+                    # Update latest data dengan semua sensor
+                    sensor_dict = {name: float(sensor_data[i]) for i, name in enumerate(self.sensor_names)}
+                    
                     self.latest_data = {
-                        'mq2': float(sensor_data[0]),
-                        'mq3': float(sensor_data[1]),
+                        'sensors': sensor_dict,
                         'prediction': int(prediction),
                         'confidence': float(confidence),
                         'interpretation': self.interpret_prediction(prediction),
@@ -231,8 +235,8 @@ class ESP32BidirectionalProcessor:
                     
                     # Add to chart data
                     self.chart_data['timestamps'].append(timestamp_str)
-                    self.chart_data['mq2_values'].append(float(sensor_data[0]))
-                    self.chart_data['mq3_values'].append(float(sensor_data[1]))
+                    for i, name in enumerate(self.sensor_names):
+                        self.chart_data['sensor_values'][name].append(float(sensor_data[i]))
                     self.chart_data['predictions'].append(int(prediction))
                     self.chart_data['confidences'].append(float(confidence))
                     
@@ -299,8 +303,8 @@ class ESP32BidirectionalProcessor:
             """Clear semua data yang disimpan"""
             with self.data_lock:
                 self.chart_data['timestamps'].clear()
-                self.chart_data['mq2_values'].clear()
-                self.chart_data['mq3_values'].clear()
+                for name in self.sensor_names:
+                    self.chart_data['sensor_values'][name].clear()
                 self.chart_data['predictions'].clear()
                 self.chart_data['confidences'].clear()
                 
@@ -311,16 +315,17 @@ class ESP32BidirectionalProcessor:
                     'degraded_count': 0,
                     'error_count': 0,
                     'avg_confidence': 0.0,
-                    'avg_mq2': 0.0,
-                    'avg_mq3': 0.0
+                    'avg_sensors': {name: 0.0 for name in self.sensor_names}
                 }
                 
                 # Keep latest data but reset others
-                self.latest_data['mq2'] = 0.0
-                self.latest_data['mq3'] = 0.0
-                self.latest_data['prediction'] = 0
-                self.latest_data['confidence'] = 0.0
-                self.latest_data['interpretation'] = 'UNKNOWN'
+                self.latest_data = {
+                    'sensors': {name: 0.0 for name in self.sensor_names},
+                    'prediction': 0,
+                    'confidence': 0.0,
+                    'interpretation': 'UNKNOWN',
+                    'timestamp': datetime.now().strftime("%H:%M:%S")
+                }
                 
                 broadcast_data = self.prepare_broadcast_data()
             
@@ -364,11 +369,12 @@ class ESP32BidirectionalProcessor:
             'statistics': self.statistics,
             'chart_data': {
                 'timestamps': list(self.chart_data['timestamps']),
-                'mq2_values': [float(v) for v in self.chart_data['mq2_values']],
-                'mq3_values': [float(v) for v in self.chart_data['mq3_values']],
+                'sensor_values': {name: [float(v) for v in self.chart_data['sensor_values'][name]] 
+                                 for name in self.sensor_names},
                 'predictions': [int(v) for v in self.chart_data['predictions']],
                 'confidences': [float(v) for v in self.chart_data['confidences']]
-            }
+            },
+            'sensor_names': self.sensor_names
         }
     
     def broadcast_data_to_clients(self, data=None):
@@ -388,8 +394,6 @@ class ESP32BidirectionalProcessor:
         
         # Convert numpy values to Python floats
         confidence_float = float(confidence)
-        mq2_float = float(sensor_data[0])
-        mq3_float = float(sensor_data[1])
         
         # Update count berdasarkan prediksi
         if prediction == 0:
@@ -405,14 +409,14 @@ class ESP32BidirectionalProcessor:
             self.statistics['avg_confidence'] = total_conf / (prev_total + 1)
             
             # Update average sensor values
-            total_mq2 = self.statistics['avg_mq2'] * prev_total + mq2_float
-            total_mq3 = self.statistics['avg_mq3'] * prev_total + mq3_float
-            self.statistics['avg_mq2'] = total_mq2 / (prev_total + 1)
-            self.statistics['avg_mq3'] = total_mq3 / (prev_total + 1)
+            for i, name in enumerate(self.sensor_names):
+                sensor_float = float(sensor_data[i])
+                total_sensor = self.statistics['avg_sensors'][name] * prev_total + sensor_float
+                self.statistics['avg_sensors'][name] = total_sensor / (prev_total + 1)
         else:
             self.statistics['avg_confidence'] = confidence_float
-            self.statistics['avg_mq2'] = mq2_float
-            self.statistics['avg_mq3'] = mq3_float
+            for i, name in enumerate(self.sensor_names):
+                self.statistics['avg_sensors'][name] = float(sensor_data[i])
         
         self.statistics['total_requests'] = self.request_count
     
@@ -421,7 +425,7 @@ class ESP32BidirectionalProcessor:
         Jalankan inference dengan TensorFlow Lite
         
         Args:
-            sensor_data: Array numpy dengan 2 nilai sensor (MQ2, MQ3)
+            sensor_data: Array numpy dengan 8 nilai sensor
             
         Returns:
             prediction: Prediksi kelas (0=fresh, 1=degraded, 2=error)
@@ -433,18 +437,24 @@ class ESP32BidirectionalProcessor:
             return 0, 0.85, np.array([0.85, 0.10, 0.05])
         
         try:
-            # Reshape data untuk model (batch_size=1, features=2)
+            # Reshape data untuk model (batch_size=1, features=8)
             input_data = np.expand_dims(sensor_data, axis=0)
             
-            # Jika model expect 8 features, pad dengan zeros
+            # Check jika model expect features yang berbeda
             expected_features = self.input_details[0]['shape'][1]
-            if expected_features == 8 and len(sensor_data) == 2:
-                # Pad dengan zeros untuk 6 sensor lainnya
-                padded_data = np.zeros((1, 8), dtype=np.float32)
-                padded_data[0, 0] = sensor_data[0]  # MQ2
-                padded_data[0, 1] = sensor_data[1]  # MQ3
-                input_data = padded_data
-                print("⚠️ Model expects 8 features, padding with zeros for sensors 3-8")
+            if expected_features != self.num_sensors:
+                print(f"⚠️ Model expects {expected_features} features, but received {self.num_sensors}")
+                
+                if expected_features < self.num_sensors:
+                    # Truncate jika model expect lebih sedikit
+                    input_data = input_data[:, :expected_features]
+                    print(f"⚠️ Truncating sensor data to {expected_features} features")
+                elif expected_features > self.num_sensors:
+                    # Pad dengan zeros jika model expect lebih banyak
+                    padded_data = np.zeros((1, expected_features), dtype=np.float32)
+                    padded_data[0, :self.num_sensors] = sensor_data[:expected_features]
+                    input_data = padded_data
+                    print(f"⚠️ Padding sensor data to {expected_features} features")
             
             # Set input tensor
             self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
@@ -494,12 +504,19 @@ class ESP32BidirectionalProcessor:
         timestamp = datetime.now().strftime("%H:%M:%S")
         
         print(f"\n[{timestamp}] 📊 Sensor Data + Prediction (Request #{self.request_count}):")
-        print("-" * 60)
+        print("-" * 80)
         
-        for i, (name, value) in enumerate(zip(self.sensor_names, sensor_data)):
-            print(f"{name:>6}: {value:>8.6f}")
+        # Display dalam 2 kolom
+        for i in range(0, self.num_sensors, 2):
+            for j in range(2):
+                idx = i + j
+                if idx < self.num_sensors:
+                    name = self.sensor_names[idx]
+                    value = sensor_data[idx]
+                    print(f"{name:>8}: {value:>10.6f}", end="  ")
+            print()
         
-        print("-" * 60)
+        print("-" * 80)
         
         # Display prediction
         interpretation = self.interpret_prediction(prediction)
@@ -514,7 +531,7 @@ class ESP32BidirectionalProcessor:
         else:
             print("🔴 Status: ERROR - Tidak dapat ditentukan")
         
-        print("-" * 60)
+        print("-" * 80)
     
     def start_server(self):
         """Start Flask REST API server dengan WebSocket"""
@@ -529,6 +546,8 @@ class ESP32BidirectionalProcessor:
         print(f"📋 ESP32 API: http://{local_ip}:{self.port}/api/sensor-data")
         print(f"💾 CSV file: {self.csv_filename}")
         print(f"🤖 Model: {self.model_path} ({'✅ Loaded' if self.interpreter else '❌ Not loaded'})")
+        print(f"📊 Number of sensors: {self.num_sensors}")
+        print(f"🔧 Sensor names: {', '.join(self.sensor_names)}")
         print("=" * 80)
         print("\n🔄 Server is running...")
         print("📝 Waiting for sensor data from ESP32...")
@@ -563,6 +582,7 @@ class ESP32BidirectionalProcessor:
                         'timestamp': datetime.now().isoformat(),
                         'total_samples': len(self.sensor_data_log),
                         'sensor_names': self.sensor_names,
+                        'num_sensors': self.num_sensors,
                         'host': self.host,
                         'port': self.port,
                         'model_path': self.model_path,
@@ -573,8 +593,8 @@ class ESP32BidirectionalProcessor:
                     'predictions': [int(p) for p in self.predictions_log],
                     'chart_data': {
                         'timestamps': list(self.chart_data['timestamps']),
-                        'mq2_values': [float(v) for v in self.chart_data['mq2_values']],
-                        'mq3_values': [float(v) for v in self.chart_data['mq3_values']],
+                        'sensor_values': {name: [float(v) for v in self.chart_data['sensor_values'][name]] 
+                                         for name in self.sensor_names},
                         'predictions': [int(v) for v in self.chart_data['predictions']],
                         'confidences': [float(v) for v in self.chart_data['confidences']]
                     }
@@ -636,14 +656,36 @@ def create_templates_folder():
         @keyframes blinker {
             50% { opacity: 0.5; }
         }
+        .sensor-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+        .sensor-card {
+            background: linear-gradient(135deg, #374151 0%, #1F2937 100%);
+            border-radius: 10px;
+            padding: 1rem;
+            border-left: 4px solid #3B82F6;
+        }
+        .sensor-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #10B981;
+        }
+        .sensor-name {
+            font-size: 0.9rem;
+            color: #9CA3AF;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
     </style>
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
     <div class="container mx-auto p-4">
         <!-- Header -->
         <div class="text-center mb-8">
-            <h1 class="text-4xl font-bold text-blue-400 mb-2">🤖 ESP32 Sensor Monitor</h1>
-            <p class="text-gray-300">Real-time AI Prediction Dashboard</p>
+            <h1 class="text-4xl font-bold text-blue-400 mb-2">🤖 ESP32 8-Sensor Monitor</h1>
+            <p class="text-gray-300">Real-time AI Prediction Dashboard with 8 MQ Sensors</p>
             <div class="flex justify-center space-x-4 mt-4 text-sm">
                 <div class="bg-gray-800 p-2 rounded">
                     <span class="text-gray-400">Server:</span> 
@@ -657,6 +699,24 @@ def create_templates_folder():
                     <span class="text-gray-400">Last Update:</span> 
                     <span id="last-update" class="text-yellow-300">Just now</span>
                 </div>
+                <div class="bg-gray-800 p-2 rounded">
+                    <span class="text-gray-400">Sensors:</span> 
+                    <span class="text-purple-300">{{ num_sensors }}</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Sensor Grid -->
+        <div class="bg-gray-800 rounded-xl p-6 shadow-lg mb-8">
+            <h2 class="text-2xl font-bold text-blue-300 mb-4">📊 Sensor Readings</h2>
+            <div class="sensor-grid" id="sensor-grid">
+                {% for sensor in sensor_names %}
+                <div class="sensor-card">
+                    <div class="sensor-name">{{ sensor }}</div>
+                    <div id="{{ sensor }}-value" class="sensor-value">0.000000</div>
+                    <div class="text-xs text-gray-400 mt-1">Avg: <span id="{{ sensor }}-avg">0.000000</span></div>
+                </div>
+                {% endfor %}
             </div>
         </div>
 
@@ -664,19 +724,19 @@ def create_templates_folder():
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
             <!-- Latest Data Card -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-blue-300 mb-4">📊 Latest Sensor Data</h2>
+                <h2 class="text-2xl font-bold text-blue-300 mb-4">📈 Latest Data</h2>
                 <div class="space-y-4">
-                    <div class="flex justify-between items-center p-3 bg-gray-700 rounded">
-                        <span class="text-lg">MQ2 Value:</span>
-                        <span id="mq2-value" class="text-2xl font-bold text-green-400">0.000</span>
-                    </div>
-                    <div class="flex justify-between items-center p-3 bg-gray-700 rounded">
-                        <span class="text-lg">MQ3 Value:</span>
-                        <span id="mq3-value" class="text-2xl font-bold text-blue-400">0.000</span>
-                    </div>
                     <div class="flex justify-between items-center p-3 bg-gray-700 rounded">
                         <span class="text-lg">Timestamp:</span>
                         <span id="timestamp" class="text-xl font-mono">00:00:00</span>
+                    </div>
+                    <div class="flex justify-between items-center p-3 bg-gray-700 rounded">
+                        <span class="text-lg">Request Count:</span>
+                        <span id="request-count" class="text-xl font-bold">0</span>
+                    </div>
+                    <div class="flex justify-between items-center p-3 bg-gray-700 rounded">
+                        <span class="text-lg">Data Points:</span>
+                        <span id="data-points" class="text-xl">0</span>
                     </div>
                 </div>
             </div>
@@ -700,7 +760,7 @@ def create_templates_folder():
 
             <!-- Statistics Card -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-green-300 mb-4">📈 Statistics</h2>
+                <h2 class="text-2xl font-bold text-green-300 mb-4">📊 Statistics</h2>
                 <div class="space-y-3">
                     <div class="flex justify-between">
                         <span>Total Requests:</span>
@@ -722,14 +782,6 @@ def create_templates_folder():
                         <span>Avg Confidence:</span>
                         <span id="avg-confidence" class="font-bold">0.0%</span>
                     </div>
-                    <div class="flex justify-between">
-                        <span>Avg MQ2:</span>
-                        <span id="avg-mq2" class="font-bold">0.000</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span>Avg MQ3:</span>
-                        <span id="avg-mq3" class="font-bold">0.000</span>
-                    </div>
                 </div>
             </div>
         </div>
@@ -741,6 +793,14 @@ def create_templates_folder():
                 <h2 class="text-2xl font-bold text-blue-300 mb-4">📈 Sensor Values Over Time</h2>
                 <div class="h-64">
                     <canvas id="sensor-chart"></canvas>
+                </div>
+                <div class="mt-4">
+                    <label class="text-gray-300 mr-2">Select Sensor:</label>
+                    <select id="sensor-select" class="bg-gray-700 text-white px-3 py-1 rounded">
+                        {% for sensor in sensor_names %}
+                        <option value="{{ sensor }}">{{ sensor }}</option>
+                        {% endfor %}
+                    </select>
                 </div>
             </div>
 
@@ -780,8 +840,9 @@ def create_templates_folder():
 
         <!-- Footer -->
         <div class="text-center mt-8 text-gray-500 text-sm">
-            <p>ESP32 Sensor Monitor Dashboard v1.0 | Real-time AI Inference System</p>
+            <p>ESP32 8-Sensor Monitor Dashboard v1.0 | Real-time AI Inference System</p>
             <p class="mt-1">Connected to: <span id="api-endpoint" class="text-blue-300">http://{{ host }}:{{ port }}/api/sensor-data</span></p>
+            <p class="mt-1">Sensors: {{ sensor_names|join(', ') }}</p>
         </div>
     </div>
 
@@ -790,20 +851,45 @@ def create_templates_folder():
         const socket = io();
         let chartData = {
             timestamps: [],
-            mq2_values: [],
-            mq3_values: [],
+            sensor_values: {},
             predictions: [],
             confidences: []
         };
         
+        let sensorNames = {{ sensor_names|tojson }};
+        let currentSensor = sensorNames[0];
+        
         let sensorChart, predictionChart, confidenceGauge;
+
+        // Initialize sensor values object
+        sensorNames.forEach(sensor => {
+            chartData.sensor_values[sensor] = [];
+        });
 
         // Update UI with latest data
         function updateUI(data) {
+            // Update sensor values
+            sensorNames.forEach(sensor => {
+                const valueElement = document.getElementById(`${sensor}-value`);
+                const avgElement = document.getElementById(`${sensor}-avg`);
+                
+                if (valueElement && data.latest_data.sensors[sensor] !== undefined) {
+                    valueElement.textContent = data.latest_data.sensors[sensor].toFixed(6);
+                }
+                
+                if (avgElement && data.statistics.avg_sensors && data.statistics.avg_sensors[sensor] !== undefined) {
+                    avgElement.textContent = data.statistics.avg_sensors[sensor].toFixed(6);
+                }
+            });
+            
             // Update latest data
-            document.getElementById('mq2-value').textContent = data.latest_data.mq2.toFixed(6);
-            document.getElementById('mq3-value').textContent = data.latest_data.mq3.toFixed(6);
             document.getElementById('timestamp').textContent = data.latest_data.timestamp;
+            document.getElementById('request-count').textContent = data.statistics.total_requests;
+            
+            // Update data points count
+            if (data.chart_data && data.chart_data.timestamps) {
+                document.getElementById('data-points').textContent = data.chart_data.timestamps.length;
+            }
             
             // Update prediction status
             const predictionStatus = document.getElementById('prediction-status');
@@ -831,8 +917,6 @@ def create_templates_folder():
             document.getElementById('error-count').textContent = data.statistics.error_count;
             document.getElementById('avg-confidence').textContent = 
                 (data.statistics.avg_confidence * 100).toFixed(1) + '%';
-            document.getElementById('avg-mq2').textContent = data.statistics.avg_mq2.toFixed(6);
-            document.getElementById('avg-mq3').textContent = data.statistics.avg_mq3.toFixed(6);
             
             // Update last update time
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
@@ -890,18 +974,10 @@ def create_templates_folder():
                     labels: chartData.timestamps,
                     datasets: [
                         {
-                            label: 'MQ2',
-                            data: chartData.mq2_values,
+                            label: currentSensor,
+                            data: chartData.sensor_values[currentSensor] || [],
                             borderColor: '#10B981',
                             backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                            tension: 0.4,
-                            fill: true
-                        },
-                        {
-                            label: 'MQ3',
-                            data: chartData.mq3_values,
-                            borderColor: '#3B82F6',
-                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
                             tension: 0.4,
                             fill: true
                         }
@@ -978,8 +1054,8 @@ def create_templates_folder():
         function updateCharts() {
             if (sensorChart) {
                 sensorChart.data.labels = chartData.timestamps;
-                sensorChart.data.datasets[0].data = chartData.mq2_values;
-                sensorChart.data.datasets[1].data = chartData.mq3_values;
+                sensorChart.data.datasets[0].data = chartData.sensor_values[currentSensor] || [];
+                sensorChart.data.datasets[0].label = currentSensor;
                 sensorChart.update();
             }
             
@@ -1039,10 +1115,25 @@ def create_templates_folder():
             alert('Export feature will be available in the next update');
         });
 
+        // Sensor select change handler
+        document.getElementById('sensor-select').addEventListener('change', (e) => {
+            currentSensor = e.target.value;
+            updateCharts();
+        });
+
         // Initialize everything when page loads
         document.addEventListener('DOMContentLoaded', () => {
             initGauge();
             initCharts();
+            
+            // Populate sensor select
+            const sensorSelect = document.getElementById('sensor-select');
+            sensorNames.forEach(sensor => {
+                const option = document.createElement('option');
+                option.value = sensor;
+                option.textContent = sensor;
+                sensorSelect.appendChild(option);
+            });
             
             // Initial data fetch
             fetch('/api/get-latest-data')
