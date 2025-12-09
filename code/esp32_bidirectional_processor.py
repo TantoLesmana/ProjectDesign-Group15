@@ -18,6 +18,7 @@ import socket
 import threading
 import collections
 import traceback
+import random
 
 # TensorFlow Lite import
 try:
@@ -432,47 +433,38 @@ class ESP32BidirectionalProcessor:
             confidence: Confidence score
             probabilities: Array dengan semua probabilitas kelas
         """
-        if self.interpreter is None:
-            # Simulate prediction jika model tidak tersedia
-            return 0, 0.85, np.array([0.85, 0.10, 0.05])
-        
+        # Rule-based prediction using MQ7 sensor value instead of model inference
+        # MQ7 is expected to be in the sensor list. Rule:
+        # - MQ7 >= 0.7 => DEGRADED (1)
+        # - MQ7 <  0.7 => FRESH (0)
         try:
-            # Reshape data untuk model (batch_size=1, features=8)
-            input_data = np.expand_dims(sensor_data, axis=0)
-            
-            # Check jika model expect features yang berbeda
-            expected_features = self.input_details[0]['shape'][1]
-            if expected_features != self.num_sensors:
-                print(f"⚠️ Model expects {expected_features} features, but received {self.num_sensors}")
-                
-                if expected_features < self.num_sensors:
-                    # Truncate jika model expect lebih sedikit
-                    input_data = input_data[:, :expected_features]
-                    print(f"⚠️ Truncating sensor data to {expected_features} features")
-                elif expected_features > self.num_sensors:
-                    # Pad dengan zeros jika model expect lebih banyak
-                    padded_data = np.zeros((1, expected_features), dtype=np.float32)
-                    padded_data[0, :self.num_sensors] = sensor_data[:expected_features]
-                    input_data = padded_data
-                    print(f"⚠️ Padding sensor data to {expected_features} features")
-            
-            # Set input tensor
-            self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
-            
-            # Run inference
-            self.interpreter.invoke()
-            
-            # Get output
-            output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
-            
-            # Get prediction
-            prediction = np.argmax(output_data[0])
-            confidence = np.max(output_data[0])
-            
-            return int(prediction), float(confidence), output_data[0]
-            
+            # Find index for MQ7 (fallback to index 5 if not present)
+            try:
+                mq7_index = self.sensor_names.index("MQ7")
+            except ValueError:
+                mq7_index = 5
+
+            mq7_value = float(sensor_data[mq7_index])
+
+            # Determine class from MQ7 threshold
+            if mq7_value >= 0.7:
+                prediction = 1  # DEGRADED
+            else:
+                prediction = 0  # FRESH
+
+            # Randomize confidence between 0.6 and 0.9 as requested
+            confidence = float(random.uniform(0.6, 0.9))
+
+            # Build probability vector matching the prediction
+            if prediction == 1:
+                probabilities = np.array([1.0 - confidence, confidence, 0.0], dtype=np.float32)
+            else:
+                probabilities = np.array([confidence, 1.0 - confidence, 0.0], dtype=np.float32)
+
+            return int(prediction), float(confidence), probabilities
+
         except Exception as e:
-            print(f"❌ Error during inference: {e}")
+            print(f"❌ Error reading MQ7 for rule-based prediction: {e}")
             traceback.print_exc()
             return None, None, None
     
@@ -503,7 +495,7 @@ class ESP32BidirectionalProcessor:
         """Display data sensor dengan format yang rapi di console"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         
-        print(f"\n[{timestamp}] 📊 Sensor Data + Prediction (Request #{self.request_count}):")
+        print(f"\n[{timestamp}] Sensor Data + Prediction (Request #{self.request_count}):")
         print("-" * 80)
         
         # Display dalam 2 kolom
@@ -521,7 +513,7 @@ class ESP32BidirectionalProcessor:
         # Display prediction
         interpretation = self.interpret_prediction(prediction)
         print(f"🤖 AI Prediction: {interpretation}")
-        print(f"📊 Confidence: {confidence:.3f}")
+        print(f"Confidence: {confidence:.3f}")
         
         # Visual indicator
         if prediction == 0:
@@ -546,10 +538,10 @@ class ESP32BidirectionalProcessor:
         print(f"📋 ESP32 API: http://{local_ip}:{self.port}/api/sensor-data")
         print(f"💾 CSV file: {self.csv_filename}")
         print(f"🤖 Model: {self.model_path} ({'✅ Loaded' if self.interpreter else '❌ Not loaded'})")
-        print(f"📊 Number of sensors: {self.num_sensors}")
+        print(f"Number of sensors: {self.num_sensors}")
         print(f"🔧 Sensor names: {', '.join(self.sensor_names)}")
         print("=" * 80)
-        print("\n🔄 Server is running...")
+        print("\nServer is running...")
         print("📝 Waiting for sensor data from ESP32...")
         print("🤖 Running AI inference on each request...")
         print("📤 Sending predictions back via JSON response...")
@@ -561,7 +553,7 @@ class ESP32BidirectionalProcessor:
             self.socketio.run(self.app, host=self.host, port=self.port, debug=False, allow_unsafe_werkzeug=True)
         except KeyboardInterrupt:
             print("\n🛑 Stopping server...")
-            print(f"📊 Total requests processed: {self.request_count}")
+            print(f"Total requests processed: {self.request_count}")
         except Exception as e:
             print(f"❌ Error running server: {e}")
             traceback.print_exc()
@@ -658,7 +650,7 @@ def create_templates_folder():
         }
         .sensor-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 1rem;
         }
         .sensor-card {
@@ -684,7 +676,7 @@ def create_templates_folder():
     <div class="container mx-auto p-4">
         <!-- Header -->
         <div class="text-center mb-8">
-            <h1 class="text-4xl font-bold text-blue-400 mb-2">🤖 ESP32 8-Sensor Monitor</h1>
+            <h1 class="text-4xl font-bold text-blue-400 mb-2">ESP32 8-Sensor Monitor</h1>
             <p class="text-gray-300">Real-time AI Prediction Dashboard with 8 MQ Sensors</p>
             <div class="flex justify-center space-x-4 mt-4 text-sm">
                 <div class="bg-gray-800 p-2 rounded">
@@ -708,7 +700,7 @@ def create_templates_folder():
 
         <!-- Sensor Grid -->
         <div class="bg-gray-800 rounded-xl p-6 shadow-lg mb-8">
-            <h2 class="text-2xl font-bold text-blue-300 mb-4">📊 Sensor Readings</h2>
+            <h2 class="text-2xl font-bold text-blue-300 mb-4">Sensor Readings</h2>
             <div class="sensor-grid" id="sensor-grid">
                 {% for sensor in sensor_names %}
                 <div class="sensor-card">
@@ -724,7 +716,7 @@ def create_templates_folder():
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
             <!-- Latest Data Card -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-blue-300 mb-4">📈 Latest Data</h2>
+                <h2 class="text-2xl font-bold text-blue-300 mb-4">Latest Data</h2>
                 <div class="space-y-4">
                     <div class="flex justify-between items-center p-3 bg-gray-700 rounded">
                         <span class="text-lg">Timestamp:</span>
@@ -743,7 +735,7 @@ def create_templates_folder():
 
             <!-- AI Prediction Card -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-purple-300 mb-4">🤖 AI Prediction</h2>
+                <h2 class="text-2xl font-bold text-purple-300 mb-4">AI Prediction</h2>
                 <div class="text-center">
                     <div id="prediction-status" class="text-4xl font-bold mb-4 p-4 rounded-lg status-fresh">
                         FRESH
@@ -760,7 +752,7 @@ def create_templates_folder():
 
             <!-- Statistics Card -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-green-300 mb-4">📊 Statistics</h2>
+                <h2 class="text-2xl font-bold text-green-300 mb-4">Statistics</h2>
                 <div class="space-y-3">
                     <div class="flex justify-between">
                         <span>Total Requests:</span>
@@ -790,7 +782,7 @@ def create_templates_folder():
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
             <!-- Sensor Values Chart -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-blue-300 mb-4">📈 Sensor Values Over Time</h2>
+                <h2 class="text-2xl font-bold text-blue-300 mb-4">Sensor Values Over Time</h2>
                 <div class="h-64">
                     <canvas id="sensor-chart"></canvas>
                 </div>
@@ -806,7 +798,7 @@ def create_templates_folder():
 
             <!-- Predictions Chart -->
             <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 class="text-2xl font-bold text-purple-300 mb-4">📊 Prediction History</h2>
+                <h2 class="text-2xl font-bold text-purple-300 mb-4">Prediction History</h2>
                 <div class="h-64">
                     <canvas id="prediction-chart"></canvas>
                 </div>
@@ -815,16 +807,16 @@ def create_templates_folder():
 
         <!-- Control Panel -->
         <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-            <h2 class="text-2xl font-bold text-yellow-300 mb-4">⚙️ Control Panel</h2>
+            <h2 class="text-2xl font-bold text-yellow-300 mb-4">Control Panel</h2>
             <div class="flex flex-wrap gap-4">
                 <button id="refresh-btn" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">
-                    🔄 Refresh Data
+                    Refresh Data
                 </button>
                 <button id="clear-btn" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">
-                    🗑️ Clear All Data
+                    Clear All Data
                 </button>
                 <button id="export-btn" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded">
-                    📥 Export Data
+                    Export Data
                 </button>
                 <div class="ml-auto">
                     <label class="text-gray-300 mr-2">Max Data Points:</label>
@@ -906,7 +898,7 @@ def create_templates_folder():
             }
             
             // Update confidence
-            const confidencePercent = (data.latest_data.confidence * 100).toFixed(1);
+            const confidencePercent = (data.latest_data.confidence * 100 ).toFixed(1);
             document.getElementById('confidence-value').textContent = confidencePercent + '%';
             updateGauge(data.latest_data.confidence);
             
@@ -916,7 +908,7 @@ def create_templates_folder():
             document.getElementById('degraded-count').textContent = data.statistics.degraded_count;
             document.getElementById('error-count').textContent = data.statistics.error_count;
             document.getElementById('avg-confidence').textContent = 
-                (data.statistics.avg_confidence * 100).toFixed(1) + '%';
+                (data.statistics.avg_confidence * 100 ).toFixed(1) + '%';
             
             // Update last update time
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
@@ -927,42 +919,85 @@ def create_templates_folder():
                 updateCharts();
             }
         }
-
-        // Initialize confidence gauge
-        function initGauge() {
-            const ctx = document.getElementById('confidence-gauge').getContext('2d');
-            confidenceGauge = new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    datasets: [{
-                        data: [85, 15],
-                        backgroundColor: ['#10B981', '#374151'],
-                        borderWidth: 0
-                    }]
-                },
-                options: {
-                    cutout: '80%',
-                    rotation: -90,
-                    circumference: 180,
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { display: false },
-                        tooltip: { enabled: false }
-                    }
-                }
-            });
+// Gauge sederhana dengan proporsi yang benar
+function initGauge() {
+    const canvas = document.getElementById('confidence-gauge');
+    const container = canvas.parentElement;
+    
+    // Pastikan canvas berbentuk persegi (square)
+    const size = Math.min(container.clientWidth, container.clientHeight);
+    canvas.width = size;
+    canvas.height = size;
+    
+    const ctx = canvas.getContext('2d');
+    
+    function drawGauge(value) {
+        const width = canvas.width;
+        const height = canvas.height;
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const radius = Math.min(width, height) * 0.4;
+        
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+        
+        // Draw background arc
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, Math.PI, 0, false);
+        ctx.strokeStyle = '#374151';
+        ctx.lineWidth = radius * 0.2; // Line width proporsional
+        ctx.lineCap = 'round';
+        ctx.stroke();
+        
+        // Draw value arc
+        const endAngle = Math.PI + (value * Math.PI);
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, Math.PI, endAngle, false);
+        
+        // Gradient color berdasarkan nilai
+        const gradient = ctx.createLinearGradient(0, 0, width, 0);
+        if (value >= 0.8) {
+            gradient.addColorStop(0, '#10B981');
+            gradient.addColorStop(1, '#34D399');
+        } else if (value >= 0.6) {
+            gradient.addColorStop(0, '#F59E0B');
+            gradient.addColorStop(1, '#FBBF24');
+        } else {
+            gradient.addColorStop(0, '#EF4444');
+            gradient.addColorStop(1, '#F87171');
         }
-
-        // Update confidence gauge
-        function updateGauge(confidence) {
-            if (confidenceGauge) {
-                const confidencePercent = confidence * 100;
-                confidenceGauge.data.datasets[0].data = [confidencePercent, 100 - confidencePercent];
-                confidenceGauge.update();
-            }
+        
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = radius * 0.2;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+    }
+    
+    // Handle resize - tetap pertahankan aspect ratio square
+    function handleResize() {
+        const size = Math.min(container.clientWidth, container.clientHeight);
+        canvas.width = size;
+        canvas.height = size;
+        if (window.currentConfidence !== undefined) {
+            drawGauge(window.currentConfidence);
         }
+    }
+    
+    window.addEventListener('resize', handleResize);
+    
+    window.drawGauge = drawGauge;
+    window.currentConfidence = 0.85;
+    drawGauge(0.85);
+}
 
+function updateGauge(confidence) {
+    if (window.drawGauge) {
+        window.drawGauge(confidence);
+        window.currentConfidence = confidence;
+    }
+    document.getElementById('confidence-value').textContent = 
+        (confidence * 100).toFixed(1) + '%';
+}
         // Initialize charts
         function initCharts() {
             const sensorCtx = document.getElementById('sensor-chart').getContext('2d');
