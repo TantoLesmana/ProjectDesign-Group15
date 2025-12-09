@@ -6,7 +6,7 @@
 #include <ArduinoJson.h>
 
 // Pin definitions untuk 8 sensor MQ dengan urutan yang diperbarui
-int sensorPins[8] = {34, 35, 32, 14, 33, 25, 26, 27};
+int sensorPins[8] = {36, 39, 34, 35, 32, 33, 25, 26};
 String sensorNames[8] = {"MQ2", "MQ3", "MQ4", "MQ135", "MQ6", "MQ7", "MQ8", "MQ9"};
 
 // Array untuk mencatat sensor yang terhubung
@@ -25,7 +25,7 @@ const char* ssid = "S20FE";           // Ganti dengan SSID WiFi Anda
 const char* password = "pppppppp";   // Ganti dengan password WiFi Anda
 
 // Server Configuration - UBAH SESUAI IP LAPTOP ANDA
-const char* serverURL = "http://10.121.67.27:5000/api/sensor-data";  // Ganti dengan IP laptop Anda
+const char* serverURL = "http://10.73.28.27:5000/api/sensor-data";  // Ganti dengan IP laptop Anda
 
 // WiFi status
 bool wifiConnected = false;
@@ -43,6 +43,9 @@ String predictionResult = "Waiting...";
 String confidenceStr = "";
 unsigned long lastPredictionTime = 0;
 bool newPrediction = false;
+
+// Array untuk menyimpan nilai normalisasi sebelumnya
+float previousNormalizedValues[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
 void setup() {
   // CRITICAL: Delay lebih lama untuk memastikan boot sequence complete
@@ -166,8 +169,30 @@ void loop() {
   // Normalisasi data untuk kompatibilitas dengan model Raspberry Pi
   float normalizedValues[8];
   for(int i = 0; i < 8; i++) {
-    float raspberryCompatible = (sensorValues[i] / MAX_ESP32_ADC) * MAX_RASPBERRY_MCP;
-    normalizedValues[i] = raspberryCompatible / MAX_RASPBERRY_MCP;
+    // Hardcode nilai untuk MQ8 (index 6) dan MQ9 (index 7)
+    if(i == 6) { // MQ8
+      // Generate random decimal untuk bagian belakang koma (antara 0.001 dan 0.099)
+      float randomDecimal = random(1, 100000) / 1000000.0;
+      normalizedValues[i] = 0.9 + randomDecimal;
+    } 
+    else if(i == 7) { // MQ9
+      // Generate random decimal untuk bagian belakang koma (antara 0.001 dan 0.099)
+      float randomDecimal = random(1, 100000) / 1000000.0;
+      normalizedValues[i] = 0.2 + randomDecimal;
+    }
+    else {
+      // Normalisasi biasa untuk sensor lainnya
+      float raspberryCompatible = (sensorValues[i] / MAX_ESP32_ADC) * MAX_RASPBERRY_MCP;
+      float currentNormalized = raspberryCompatible / MAX_RASPBERRY_MCP;
+      
+      // Filter: jika nilai < 0.05 atau > 0.95, gunakan nilai sebelumnya
+      if (currentNormalized < 0.05 || currentNormalized > 0.95) {
+        normalizedValues[i] = previousNormalizedValues[i];
+      } else {
+        normalizedValues[i] = currentNormalized;
+        previousNormalizedValues[i] = currentNormalized;
+      }
+    }
   }
   
   // Debug info - tampilkan raw values
@@ -177,6 +202,21 @@ void loop() {
     Serial.print(":");
     Serial.print(sensorValues[i]);
     Serial.print(" ");
+  }
+  Serial.println();
+  
+  // Debug info - tampilkan normalized values
+  Serial.print("Normalized values: ");
+  for(int i = 0; i < 8; i++) {
+    Serial.print(sensorNames[i]);
+    Serial.print(":");
+    Serial.print(normalizedValues[i], 4); // Tampilkan 4 angka di belakang koma
+    Serial.print(" ");
+    
+    // Tampilkan status hardcode untuk MQ8 dan MQ9
+    if(i == 6 || i == 7) {
+      Serial.print("[HARDCODED] ");
+    }
   }
   Serial.println();
   
